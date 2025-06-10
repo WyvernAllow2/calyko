@@ -15,3 +15,9 @@ if(MSVC)
 else()
     target_compile_options(${PROJECT_NAME} PRIVATE -std=c99 -pedantic -Wall -Wextra)
 endif()
+
+find_package(Vulkan REQUIRED)
+
+target_link_libraries(${PROJECT_NAME}
+    Vulkan
+)
