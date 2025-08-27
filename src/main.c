@@ -199,6 +199,7 @@ static uint32_t find_compute_queue_index(VkPhysicalDevice physical_device) {
      * guarantees that every device has at least one queue family with VK_QUEUE_COMPUTE_BIT.
      */
     assert(!"Could not find a queue family capable of compute");
+    return 0;
 }
 
 typedef struct Device_Info {
