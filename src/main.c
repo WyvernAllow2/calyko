@@ -250,6 +250,7 @@ static Device_Info find_best_device(VkInstance instance) {
         }
     }
 
+    free(physical_devices);
     return best_device;
 }
 
@@ -263,7 +264,7 @@ static VkDevice create_device(const Device_Info *info) {
     };
 
     const VkDeviceCreateInfo device_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pQueueCreateInfos = &queue_info,
         .queueCreateInfoCount = 1,
     };
@@ -276,6 +277,166 @@ static VkDevice create_device(const Device_Info *info) {
     }
 
     return device;
+}
+
+static uint32_t *read_file_bytes(const char *filename, uint32_t *len) {
+    *len = 0;
+
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror(filename);
+        return NULL;
+    }
+
+    fseek(file, 0, SEEK_END);
+    size_t file_size = (size_t)ftell(file);
+    rewind(file);
+
+    uint32_t *bytes = malloc(file_size);
+    if (!bytes) {
+        perror("malloc() failed");
+        fclose(file);
+        return NULL;
+    }
+
+    if (fread(bytes, sizeof(*bytes), file_size, file) != file_size / sizeof(*bytes)) {
+        perror("fread() failed");
+        free(bytes);
+        fclose(file);
+        return NULL;
+    }
+
+    *len = file_size;
+    return bytes;
+}
+
+static VkShaderModule load_shader_module(VkDevice device, const char *filename) {
+    uint32_t code_len;
+    uint32_t *code = read_file_bytes(filename, &code_len);
+    if (!code) {
+        fprintf(stderr, "read_file_bytes failed\n");
+        return VK_NULL_HANDLE;
+    }
+
+    const VkShaderModuleCreateInfo shader_module_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pCode = code,
+        .codeSize = code_len,
+    };
+
+    VkShaderModule shader_module;
+    VkResult result = vkCreateShaderModule(device, &shader_module_info, NULL, &shader_module);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreateShaderModule failed: %s\n", string_VkResult(result));
+        free(code);
+        return VK_NULL_HANDLE;
+    }
+
+    free(code);
+    return shader_module;
+}
+
+static VkDescriptorSetLayout create_descriptor_set_layout(VkDevice device) {
+    const VkDescriptorSetLayoutBinding bindings[] = {
+        (VkDescriptorSetLayoutBinding){
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+    };
+
+    const VkDescriptorSetLayoutCreateInfo set_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pBindings = bindings,
+        .bindingCount = ARRAY_LEN(bindings),
+    };
+
+    VkDescriptorSetLayout layout;
+    VkResult result = vkCreateDescriptorSetLayout(device, &set_layout_info, NULL, &layout);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreateDescriptorSetLayout() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return layout;
+}
+
+static VkPipelineLayout create_pipeline_layout(VkDevice device, VkDescriptorSetLayout set_layout) {
+    const VkPipelineLayoutCreateInfo pipeline_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pSetLayouts = &set_layout,
+        .setLayoutCount = 1,
+    };
+
+    VkPipelineLayout layout;
+    VkResult result = vkCreatePipelineLayout(device, &pipeline_layout_info, NULL, &layout);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreatePipelineLayout failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return layout;
+}
+
+typedef struct WorkgroupSizes {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+} WorkgroupSizes;
+
+static VkPipeline create_compute_pipeline(VkDevice device, VkPipelineLayout layout,
+                                          VkShaderModule module, WorkgroupSizes workgroup_sizes) {
+    const VkSpecializationMapEntry entries[] = {
+        (VkSpecializationMapEntry){
+            .constantID = 0,
+            .offset = offsetof(WorkgroupSizes, x),
+            sizeof(uint32_t),
+        },
+
+        (VkSpecializationMapEntry){
+            .constantID = 1,
+            .offset = offsetof(WorkgroupSizes, y),
+            sizeof(uint32_t),
+        },
+
+        (VkSpecializationMapEntry){
+            .constantID = 2,
+            .offset = offsetof(WorkgroupSizes, y),
+            sizeof(uint32_t),
+        },
+    };
+
+    const VkSpecializationInfo specialization_info = {
+        .pMapEntries = entries,
+        .mapEntryCount = ARRAY_LEN(entries),
+        .dataSize = sizeof(WorkgroupSizes),
+        .pData = &workgroup_sizes,
+    };
+
+    const VkPipelineShaderStageCreateInfo shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .module = module,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .pName = "main",
+        .pSpecializationInfo = &specialization_info,
+    };
+
+    const VkComputePipelineCreateInfo compute_pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .layout = layout,
+        .stage = shader_stage_info,
+    };
+
+    VkPipeline pipeline;
+    VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &compute_pipeline_info,
+                                               NULL, &pipeline);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreateComputePipelines() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return pipeline;
 }
 
 int main(void) {
@@ -323,6 +484,36 @@ int main(void) {
     VkQueue compute_queue;
     vkGetDeviceQueue(device, device_info.compute_family_index, 0, &compute_queue);
 
+    VkDescriptorSetLayout descriptor_set_layout = create_descriptor_set_layout(device);
+    if (!descriptor_set_layout) {
+        fprintf(stderr, "create_descriptor_set_layout() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkPipelineLayout pipeline_layout = create_pipeline_layout(device, descriptor_set_layout);
+    if (!descriptor_set_layout) {
+        fprintf(stderr, "create_pipeline_layout() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkShaderModule shader = load_shader_module(device, "shaders/pathtracer.comp.spv");
+    if (!shader) {
+        fprintf(stderr, "load_shader_module() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkPipeline pipeline =
+        create_compute_pipeline(device, pipeline_layout, shader, (WorkgroupSizes){8, 8, 1});
+    if (!pipeline) {
+        fprintf(stderr, "create_pipeline_layout() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    vkDestroyPipeline(device, pipeline, NULL);
+    vkDestroyShaderModule(device, shader, NULL);
+    vkDestroyPipelineLayout(device, pipeline_layout, NULL);
+    vkDestroyDescriptorSetLayout(device, descriptor_set_layout, NULL);
+    vkDestroyDevice(device, NULL);
     DestroyDebugUtilsMessengerEXT(instance, messenger, NULL);
     vkDestroyInstance(instance, NULL);
     return EXIT_SUCCESS;
