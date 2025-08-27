@@ -180,6 +180,103 @@ static VkDebugUtilsMessengerEXT create_debug_messenger(
     return messenger;
 }
 
+static uint32_t find_compute_queue_index(VkPhysicalDevice physical_device) {
+    uint32_t queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, NULL);
+    VkQueueFamilyProperties *properties = malloc(sizeof(*properties) * queue_family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, properties);
+
+    for (uint32_t i = 0; i < queue_family_count; i++) {
+        if (properties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+            free(properties);
+            return i;
+        }
+    }
+
+    free(properties);
+
+    /* Should be unreachable on conformant implementations; the Vulkan specification
+     * guarantees that every device has at least one queue family with VK_QUEUE_COMPUTE_BIT.
+     */
+    assert(!"Could not find a queue family capable of compute");
+}
+
+typedef struct Device_Info {
+    VkPhysicalDevice physical_device;
+    VkPhysicalDeviceProperties properties;
+    VkPhysicalDeviceMemoryProperties memory_properties;
+
+    uint32_t compute_family_index;
+} Device_Info;
+
+static void get_device_info(VkPhysicalDevice physical_device, Device_Info *info) {
+    assert(info);
+    *info = (Device_Info){
+        .physical_device = physical_device,
+    };
+
+    vkGetPhysicalDeviceProperties(physical_device, &info->properties);
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &info->memory_properties);
+    info->compute_family_index = find_compute_queue_index(info->physical_device);
+}
+
+static int rate_physical_device(const Device_Info *info) {
+    int score = 0;
+    if (info->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        score += 100;
+    }
+
+    return score;
+}
+
+static Device_Info find_best_device(VkInstance instance) {
+    uint32_t device_count = 0;
+    vkEnumeratePhysicalDevices(instance, &device_count, NULL);
+    VkPhysicalDevice *physical_devices = malloc(sizeof(*physical_devices) * device_count);
+    vkEnumeratePhysicalDevices(instance, &device_count, physical_devices);
+
+    int best_score = INT_MIN;
+    Device_Info best_device = {0};
+
+    for (uint32_t i = 0; i < device_count; i++) {
+        Device_Info info;
+        get_device_info(physical_devices[i], &info);
+
+        int score = rate_physical_device(&info);
+        if (score > best_score) {
+            best_score = score;
+            best_device = info;
+        }
+    }
+
+    return best_device;
+}
+
+static VkDevice create_device(const Device_Info *info) {
+    const float queue_priority = 1.0f;
+    const VkDeviceQueueCreateInfo queue_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = info->compute_family_index,
+        .queueCount = 1,
+        .pQueuePriorities = &queue_priority,
+    };
+
+    const VkDeviceCreateInfo device_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .pQueueCreateInfos = &queue_info,
+        .queueCreateInfoCount = 1,
+    };
+
+    VkDevice device = NULL;
+    VkResult result = vkCreateDevice(info->physical_device, &device_info, NULL, &device);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreateDevice() failed: %s\n", string_VkResult(result));
+        return NULL;
+    }
+
+    return device;
+}
+
 int main(void) {
     const VkDebugUtilsMessengerCreateInfoEXT debug_info = {
         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -207,6 +304,23 @@ int main(void) {
         fprintf(stderr, "create_debug_messenger() failed\n");
         return EXIT_FAILURE;
     }
+
+    Device_Info device_info = find_best_device(instance);
+    if (!device_info.physical_device) {
+        fprintf(stderr, "Failed to find a suitable physical device\n");
+        return EXIT_FAILURE;
+    }
+
+    fprintf(stderr, "Found a suitable physical device: %s\n", device_info.properties.deviceName);
+
+    VkDevice device = create_device(&device_info);
+    if (!device) {
+        fprintf(stderr, "create_device() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkQueue compute_queue;
+    vkGetDeviceQueue(device, device_info.compute_family_index, 0, &compute_queue);
 
     DestroyDebugUtilsMessengerEXT(instance, messenger, NULL);
     vkDestroyInstance(instance, NULL);
