@@ -35,3 +35,28 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Vulkan::Vulkan
 )
+
+set(SHADERS
+    shaders/pathtracer.comp
+)
+
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders)
+
+set(COMPILED_SHADERS "")
+foreach(SHADER ${SHADERS})
+    get_filename_component(FILE_NAME ${SHADER} NAME)
+    set(OUTPUT_FILE "${CMAKE_BINARY_DIR}/shaders/${FILE_NAME}.spv")
+
+    add_custom_command(
+        OUTPUT ${OUTPUT_FILE}
+        COMMAND Vulkan::glslc "${CMAKE_SOURCE_DIR}/${SHADER}" -o ${OUTPUT_FILE}
+        DEPENDS ${SHADER}
+        COMMENT "Compiling shader ${FILE_NAME}${FILE_EXT} -> ${OUTPUT_FILE}"
+        VERBATIM
+    )
+
+    list(APPEND COMPILED_SHADERS ${OUTPUT_FILE})
+endforeach()
+
+add_custom_target(Shaders ALL DEPENDS ${COMPILED_SHADERS})
+add_dependencies(${PROJECT_NAME} Shaders)
