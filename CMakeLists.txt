@@ -32,10 +32,12 @@ endif()
 
 find_package(Vulkan REQUIRED)
 add_subdirectory(deps/VulkanMemoryAllocator)
+add_subdirectory(deps/stb_image)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Vulkan::Vulkan
     VulkanMemoryAllocator
+    stb_image
 )
 
 set(SHADERS
