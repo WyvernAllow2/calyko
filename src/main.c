@@ -4,8 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vk_mem_alloc.h>
 #include <vulkan/vk_enum_string_helper.h>
 #include <vulkan/vulkan.h>
+
+#include <stb_image_write.h>
 
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -279,8 +282,8 @@ static VkDevice create_device(const Device_Info *info) {
     return device;
 }
 
-static uint32_t *read_file_bytes(const char *filename, uint32_t *len) {
-    *len = 0;
+static uint32_t *read_spirv_file(const char *filename, uint32_t *word_count) {
+    *word_count = 0;
 
     FILE *file = fopen(filename, "rb");
     if (!file) {
@@ -292,27 +295,35 @@ static uint32_t *read_file_bytes(const char *filename, uint32_t *len) {
     size_t file_size = (size_t)ftell(file);
     rewind(file);
 
-    uint32_t *bytes = malloc(file_size);
-    if (!bytes) {
-        perror("malloc() failed");
+    if (file_size % 4 != 0) {
+        fprintf(stderr, "SPIR-V file size is not a multiple of 4: %d bytes\n", file_size);
         fclose(file);
         return NULL;
     }
 
-    if (fread(bytes, sizeof(*bytes), file_size, file) != file_size / sizeof(*bytes)) {
-        perror("fread() failed");
-        free(bytes);
+    size_t num_words = file_size / 4;
+    uint32_t *words = malloc(num_words * sizeof(uint32_t));
+    if (!words) {
+        perror("malloc failed");
         fclose(file);
         return NULL;
     }
 
-    *len = file_size;
-    return bytes;
+    if (fread(words, sizeof(uint32_t), num_words, file) != num_words) {
+        perror("fread failed");
+        free(words);
+        fclose(file);
+        return NULL;
+    }
+
+    fclose(file);
+    *word_count = num_words;
+    return words;
 }
 
 static VkShaderModule load_shader_module(VkDevice device, const char *filename) {
-    uint32_t code_len;
-    uint32_t *code = read_file_bytes(filename, &code_len);
+    uint32_t word_count;
+    uint32_t *code = read_spirv_file(filename, &word_count);
     if (!code) {
         fprintf(stderr, "read_file_bytes failed\n");
         return VK_NULL_HANDLE;
@@ -321,7 +332,7 @@ static VkShaderModule load_shader_module(VkDevice device, const char *filename) 
     const VkShaderModuleCreateInfo shader_module_info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pCode = code,
-        .codeSize = code_len,
+        .codeSize = word_count * sizeof(uint32_t),
     };
 
     VkShaderModule shader_module;
@@ -439,6 +450,191 @@ static VkPipeline create_compute_pipeline(VkDevice device, VkPipelineLayout layo
     return pipeline;
 }
 
+static VkDescriptorPool create_descriptor_pool(VkDevice device) {
+    const VkDescriptorPoolCreateInfo descriptor_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .pPoolSizes =
+            &(VkDescriptorPoolSize){
+                .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .descriptorCount = 1,
+            },
+        .poolSizeCount = 1,
+    };
+
+    VkDescriptorPool descriptor_pool;
+    VkResult result = vkCreateDescriptorPool(device, &descriptor_pool_info, NULL, &descriptor_pool);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreateDescriptorPool() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return descriptor_pool;
+}
+
+static VkDescriptorSet create_descriptor_set(VkDevice device, VkDescriptorPool descriptor_pool,
+                                             VkDescriptorSetLayout layout) {
+    const VkDescriptorSetAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &layout,
+    };
+
+    VkDescriptorSet descriptor_set;
+    VkResult result = vkAllocateDescriptorSets(device, &alloc_info, &descriptor_set);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkAllocateDescriptorSets failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return descriptor_set;
+}
+
+static VmaAllocator create_vma_allocator(VkInstance instance, VkDevice device,
+                                         const Device_Info *info) {
+    const VmaAllocatorCreateInfo vma_allocator_info = {
+        .vulkanApiVersion = VK_API_VERSION_1_0,
+        .physicalDevice = info->physical_device,
+        .device = device,
+        .instance = instance,
+    };
+
+    VmaAllocator allocator;
+    VkResult result = vmaCreateAllocator(&vma_allocator_info, &allocator);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vmaCreateAllocator() failed: %s\n", string_VkResult(result));
+        return NULL;
+    }
+
+    return allocator;
+}
+
+static VkImage create_compute_image(VmaAllocator allocator, uint32_t width, uint32_t height,
+                                    VkFormat format, VmaAllocation *allocation) {
+    const VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent =
+            (VkExtent3D){
+                .width = width,
+                .height = height,
+                .depth = 1,
+            },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+
+    VkImage image;
+    VkResult result = vmaCreateImage(allocator, &image_info, &alloc_info, &image, allocation, NULL);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vmaCreateImage() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return image;
+}
+
+static VkImageView create_compute_image_view(VkDevice device, VkImage image, VkFormat format) {
+    const VkImageViewCreateInfo image_view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = format,
+        .components.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+        .components.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+        .components.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+        .components.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+        .subresourceRange =
+            (VkImageSubresourceRange){
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+    };
+
+    VkImageView view;
+    VkResult result = vkCreateImageView(device, &image_view_info, NULL, &view);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreateImageView() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return view;
+}
+
+static VkCommandPool create_command_pool(VkDevice device, const Device_Info *info) {
+    const VkCommandPoolCreateInfo command_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = info->compute_family_index,
+    };
+
+    VkCommandPool command_pool;
+    VkResult result = vkCreateCommandPool(device, &command_pool_info, NULL, &command_pool);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkCreateCommandPool() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return command_pool;
+}
+
+static VkCommandBuffer create_command_buffer(VkDevice device, VkCommandPool command_pool) {
+    const VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+
+    VkCommandBuffer command_buffer;
+    VkResult result = vkAllocateCommandBuffers(device, &alloc_info, &command_buffer);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkAllocateCommandBuffers() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return command_buffer;
+}
+
+static VkBuffer create_host_buffer(VmaAllocator allocator, VkDeviceSize size,
+                                   VmaAllocation *allocation, VmaAllocationInfo *allocation_info) {
+    const VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+    };
+
+    VkBuffer buffer;
+    VkResult result =
+        vmaCreateBuffer(allocator, &buffer_info, &alloc_info, &buffer, allocation, allocation_info);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vmaCreateBuffer() failed: %s\n", string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+
+    return buffer;
+}
+
 int main(void) {
     const VkDebugUtilsMessengerCreateInfoEXT debug_info = {
         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -502,13 +698,195 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    VkPipeline pipeline =
-        create_compute_pipeline(device, pipeline_layout, shader, (WorkgroupSizes){8, 8, 1});
+    const WorkgroupSizes workgroup_sizes = {8, 8, 1};
+    const uint32_t image_width = 512;
+    const uint32_t image_height = 512;
+    VkFormat image_format = VK_FORMAT_R8G8B8A8_UNORM;
+
+    VkPipeline pipeline = create_compute_pipeline(device, pipeline_layout, shader, workgroup_sizes);
     if (!pipeline) {
         fprintf(stderr, "create_pipeline_layout() failed\n");
         return EXIT_FAILURE;
     }
 
+    VkDescriptorPool descriptor_pool = create_descriptor_pool(device);
+    if (!descriptor_pool) {
+        fprintf(stderr, "create_descriptor_pool() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkDescriptorSet descriptor_set =
+        create_descriptor_set(device, descriptor_pool, descriptor_set_layout);
+    if (!descriptor_set) {
+        fprintf(stderr, "create_descriptor_set() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VmaAllocator allocator = create_vma_allocator(instance, device, &device_info);
+    if (!allocator) {
+        fprintf(stderr, "create_vma_allocator() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VmaAllocation compute_image_allocation;
+    VkImage compute_image = create_compute_image(allocator, image_width, image_height, image_format,
+                                                 &compute_image_allocation);
+    if (!compute_image) {
+        fprintf(stderr, "create_compute_image() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkImageView compute_image_view = create_compute_image_view(device, compute_image, image_format);
+    if (!compute_image_view) {
+        fprintf(stderr, "create_compute_image_view() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VmaAllocation host_buf_allocation;
+    VmaAllocationInfo host_buf_alloc_info;
+    VkBuffer host_buf =
+        create_host_buffer(allocator, 4 * sizeof(uint32_t) * image_width * image_height,
+                           &host_buf_allocation, &host_buf_alloc_info);
+    if (!host_buf) {
+        fprintf(stderr, "create_host_buffer() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkCommandPool command_pool = create_command_pool(device, &device_info);
+    if (!command_pool) {
+        fprintf(stderr, "create_command_pool() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    VkCommandBuffer command_buffer = create_command_buffer(device, command_pool);
+    if (!command_buffer) {
+        fprintf(stderr, "create_command_buffer() failed\n");
+        return EXIT_FAILURE;
+    }
+
+    const VkWriteDescriptorSet write_descriptor_set = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = descriptor_set,
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .pImageInfo =
+            &(VkDescriptorImageInfo){
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .imageView = compute_image_view,
+            },
+    };
+
+    vkUpdateDescriptorSets(device, 1, &write_descriptor_set, 0, NULL);
+
+    VkResult record_result = vkBeginCommandBuffer(
+        command_buffer, &(VkCommandBufferBeginInfo){
+                            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                        });
+    if (record_result != VK_SUCCESS) {
+        fprintf(stderr, "vkBeginCommandBuffer() failed: %s\n", string_VkResult(record_result));
+        return EXIT_FAILURE;
+    }
+
+    /* Transition from undefined to general for compute shader write operations. */
+    const VkImageMemoryBarrier trans_to_general = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = compute_image,
+        .subresourceRange =
+            (VkImageSubresourceRange){
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+    };
+
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
+                         &trans_to_general);
+
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
+                            &descriptor_set, 0, NULL);
+
+    vkCmdDispatch(command_buffer, (image_width + workgroup_sizes.x - 1) / workgroup_sizes.x,
+                  (image_height + workgroup_sizes.y - 1) / workgroup_sizes.y, workgroup_sizes.z);
+
+    /* Transition from general to transfer src optimal for device -> host copy */
+    const VkImageMemoryBarrier trans_to_trans_src = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = compute_image,
+        .subresourceRange =
+            (VkImageSubresourceRange){
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+    };
+
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+                         &trans_to_trans_src);
+
+    const VkBufferImageCopy copy_region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image_width, image_height, 1},
+    };
+
+    vkCmdCopyImageToBuffer(command_buffer, compute_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           host_buf, 1, &copy_region);
+
+    record_result = vkEndCommandBuffer(command_buffer);
+    if (record_result != VK_SUCCESS) {
+        fprintf(stderr, "vkEndCommandBuffer() failed: %s\n", string_VkResult(record_result));
+        return EXIT_FAILURE;
+    }
+
+    const VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pCommandBuffers = &command_buffer,
+        .commandBufferCount = 1,
+    };
+
+    vkQueueSubmit(compute_queue, 1, &submit_info, NULL);
+    vkQueueWaitIdle(compute_queue);
+
+    uint8_t *data = host_buf_alloc_info.pMappedData;
+
+    stbi_write_png("output.png", image_width, image_height, 4, data, 4 * image_width);
+
+    vkDestroyCommandPool(device, command_pool, NULL);
+    vkDestroyImageView(device, compute_image_view, NULL);
+    vmaDestroyBuffer(allocator, host_buf, host_buf_allocation);
+    vmaDestroyImage(allocator, compute_image, compute_image_allocation);
+    vmaDestroyAllocator(allocator);
+    vkDestroyDescriptorPool(device, descriptor_pool, NULL);
     vkDestroyPipeline(device, pipeline, NULL);
     vkDestroyShaderModule(device, shader, NULL);
     vkDestroyPipelineLayout(device, pipeline_layout, NULL);
