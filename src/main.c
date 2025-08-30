@@ -10,8 +10,7 @@
 #include <vulkan/vulkan.h>
 
 #include "device.h"
-
-#define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
+#include "utils.h"
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL
 vulkan_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
