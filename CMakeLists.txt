@@ -5,6 +5,8 @@ add_executable(${PROJECT_NAME}
     src/device.c
     src/device.h
     src/main.c
+    src/pipeline.c
+    src/pipeline.h
     src/utils.h
 )
 

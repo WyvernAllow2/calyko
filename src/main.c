@@ -10,6 +10,7 @@
 #include <vulkan/vulkan.h>
 
 #include "device.h"
+#include "pipeline.h"
 #include "utils.h"
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL
@@ -248,109 +249,6 @@ static VkShaderModule load_shader_module(VkDevice device, const char *filename) 
     return shader_module;
 }
 
-static VkDescriptorSetLayout create_descriptor_set_layout(VkDevice device) {
-    const VkDescriptorSetLayoutBinding bindings[] = {
-        (VkDescriptorSetLayoutBinding){
-            .binding = 0,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        },
-    };
-
-    const VkDescriptorSetLayoutCreateInfo set_layout_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .pBindings = bindings,
-        .bindingCount = ARRAY_LEN(bindings),
-    };
-
-    VkDescriptorSetLayout layout;
-    VkResult result = vkCreateDescriptorSetLayout(device, &set_layout_info, NULL, &layout);
-    if (result != VK_SUCCESS) {
-        fprintf(stderr, "vkCreateDescriptorSetLayout() failed: %s\n", string_VkResult(result));
-        return VK_NULL_HANDLE;
-    }
-
-    return layout;
-}
-
-static VkPipelineLayout create_pipeline_layout(VkDevice device, VkDescriptorSetLayout set_layout) {
-    const VkPipelineLayoutCreateInfo pipeline_layout_info = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .pSetLayouts = &set_layout,
-        .setLayoutCount = 1,
-    };
-
-    VkPipelineLayout layout;
-    VkResult result = vkCreatePipelineLayout(device, &pipeline_layout_info, NULL, &layout);
-    if (result != VK_SUCCESS) {
-        fprintf(stderr, "vkCreatePipelineLayout failed: %s\n", string_VkResult(result));
-        return VK_NULL_HANDLE;
-    }
-
-    return layout;
-}
-
-typedef struct WorkgroupSizes {
-    uint32_t x;
-    uint32_t y;
-    uint32_t z;
-} WorkgroupSizes;
-
-static VkPipeline create_compute_pipeline(VkDevice device, VkPipelineLayout layout,
-                                          VkShaderModule module, WorkgroupSizes workgroup_sizes) {
-    const VkSpecializationMapEntry entries[] = {
-        (VkSpecializationMapEntry){
-            .constantID = 0,
-            .offset = offsetof(WorkgroupSizes, x),
-            sizeof(uint32_t),
-        },
-
-        (VkSpecializationMapEntry){
-            .constantID = 1,
-            .offset = offsetof(WorkgroupSizes, y),
-            sizeof(uint32_t),
-        },
-
-        (VkSpecializationMapEntry){
-            .constantID = 2,
-            .offset = offsetof(WorkgroupSizes, y),
-            sizeof(uint32_t),
-        },
-    };
-
-    const VkSpecializationInfo specialization_info = {
-        .pMapEntries = entries,
-        .mapEntryCount = ARRAY_LEN(entries),
-        .dataSize = sizeof(WorkgroupSizes),
-        .pData = &workgroup_sizes,
-    };
-
-    const VkPipelineShaderStageCreateInfo shader_stage_info = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .module = module,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .pName = "main",
-        .pSpecializationInfo = &specialization_info,
-    };
-
-    const VkComputePipelineCreateInfo compute_pipeline_info = {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .layout = layout,
-        .stage = shader_stage_info,
-    };
-
-    VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &compute_pipeline_info,
-                                               NULL, &pipeline);
-    if (result != VK_SUCCESS) {
-        fprintf(stderr, "vkCreateComputePipelines() failed: %s\n", string_VkResult(result));
-        return VK_NULL_HANDLE;
-    }
-
-    return pipeline;
-}
-
 static VkDescriptorPool create_descriptor_pool(VkDevice device) {
     const VkDescriptorPoolCreateInfo descriptor_pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -570,36 +468,31 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    VkDescriptorSetLayout descriptor_set_layout = create_descriptor_set_layout(device.device);
-    if (!descriptor_set_layout) {
-        fprintf(stderr, "create_descriptor_set_layout() failed\n");
-        return EXIT_FAILURE;
-    }
-
-    VkPipelineLayout pipeline_layout = create_pipeline_layout(device.device, descriptor_set_layout);
-    if (!descriptor_set_layout) {
-        fprintf(stderr, "create_pipeline_layout() failed\n");
-        return EXIT_FAILURE;
-    }
-
     VkShaderModule shader = load_shader_module(device.device, "shaders/pathtracer.comp.spv");
     if (!shader) {
         fprintf(stderr, "load_shader_module() failed\n");
         return EXIT_FAILURE;
     }
 
+    const Pathtracing_Pipeline_Info pipeline_info = {
+        .compute_shader = shader,
+        .workgroup_sizes =
+            {
+                .x = 8,
+                .y = 4,
+                .z = 1,
+            },
+    };
+
+    Pathtracing_Pipeline pipeline;
+    if (!create_pathtracing_pipeline(&device, &pipeline_info, &pipeline)) {
+        fprintf(stderr, "create_pathtracing_pipeline() failed\n");
+        return EXIT_FAILURE;
+    }
+
     const uint32_t image_width = 512;
     const uint32_t image_height = 512;
     VkFormat image_format = VK_FORMAT_R8G8B8A8_UNORM;
-
-    const WorkgroupSizes workgroup_sizes = {16, 8, 1};
-
-    VkPipeline pipeline =
-        create_compute_pipeline(device.device, pipeline_layout, shader, workgroup_sizes);
-    if (!pipeline) {
-        fprintf(stderr, "create_pipeline_layout() failed\n");
-        return EXIT_FAILURE;
-    }
 
     VkDescriptorPool descriptor_pool = create_descriptor_pool(device.device);
     if (!descriptor_pool) {
@@ -608,7 +501,7 @@ int main(void) {
     }
 
     VkDescriptorSet descriptor_set =
-        create_descriptor_set(device.device, descriptor_pool, descriptor_set_layout);
+        create_descriptor_set(device.device, descriptor_pool, pipeline.descriptor_set_layout);
     if (!descriptor_set) {
         fprintf(stderr, "create_descriptor_set() failed\n");
         return EXIT_FAILURE;
@@ -706,12 +599,15 @@ int main(void) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
                          &trans_to_general);
 
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1,
                             &descriptor_set, 0, NULL);
 
-    vkCmdDispatch(command_buffer, (image_width + workgroup_sizes.x - 1) / workgroup_sizes.x,
-                  (image_height + workgroup_sizes.y - 1) / workgroup_sizes.y, workgroup_sizes.z);
+    vkCmdDispatch(
+        command_buffer,
+        (image_width + pipeline_info.workgroup_sizes.x - 1) / pipeline_info.workgroup_sizes.x,
+        (image_height + pipeline_info.workgroup_sizes.y - 1) / pipeline_info.workgroup_sizes.y,
+        pipeline_info.workgroup_sizes.z);
 
     /* Transition from general to transfer src optimal for device -> host copy */
     const VkImageMemoryBarrier trans_to_trans_src = {
@@ -780,10 +676,8 @@ int main(void) {
     vmaDestroyImage(allocator, compute_image, compute_image_allocation);
     vmaDestroyAllocator(allocator);
     vkDestroyDescriptorPool(device.device, descriptor_pool, NULL);
-    vkDestroyPipeline(device.device, pipeline, NULL);
+    destroy_pathtracing_pipeline(&device, &pipeline);
     vkDestroyShaderModule(device.device, shader, NULL);
-    vkDestroyPipelineLayout(device.device, pipeline_layout, NULL);
-    vkDestroyDescriptorSetLayout(device.device, descriptor_set_layout, NULL);
     destroy_device(&device);
     DestroyDebugUtilsMessengerEXT(instance, messenger, NULL);
     vkDestroyInstance(instance, NULL);
