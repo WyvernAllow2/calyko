@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stb_image_write.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -8,7 +9,7 @@
 #include <vulkan/vk_enum_string_helper.h>
 #include <vulkan/vulkan.h>
 
-#include <stb_image_write.h>
+#include "device.h"
 
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -181,105 +182,6 @@ static VkDebugUtilsMessengerEXT create_debug_messenger(
     }
 
     return messenger;
-}
-
-static uint32_t find_compute_queue_index(VkPhysicalDevice physical_device) {
-    uint32_t queue_family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, NULL);
-    VkQueueFamilyProperties *properties = malloc(sizeof(*properties) * queue_family_count);
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, properties);
-
-    for (uint32_t i = 0; i < queue_family_count; i++) {
-        if (properties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-            free(properties);
-            return i;
-        }
-    }
-
-    free(properties);
-
-    /* Should be unreachable on conformant implementations; the Vulkan specification
-     * guarantees that every device has at least one queue family with VK_QUEUE_COMPUTE_BIT.
-     */
-    assert(!"Could not find a queue family capable of compute");
-    return 0;
-}
-
-typedef struct Device_Info {
-    VkPhysicalDevice physical_device;
-    VkPhysicalDeviceProperties properties;
-    VkPhysicalDeviceMemoryProperties memory_properties;
-
-    uint32_t compute_family_index;
-} Device_Info;
-
-static void get_device_info(VkPhysicalDevice physical_device, Device_Info *info) {
-    assert(info);
-    *info = (Device_Info){
-        .physical_device = physical_device,
-    };
-
-    vkGetPhysicalDeviceProperties(physical_device, &info->properties);
-    vkGetPhysicalDeviceMemoryProperties(physical_device, &info->memory_properties);
-    info->compute_family_index = find_compute_queue_index(info->physical_device);
-}
-
-static int rate_physical_device(const Device_Info *info) {
-    int score = 0;
-    if (info->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-        score += 100;
-    }
-
-    return score;
-}
-
-static Device_Info find_best_device(VkInstance instance) {
-    uint32_t device_count = 0;
-    vkEnumeratePhysicalDevices(instance, &device_count, NULL);
-    VkPhysicalDevice *physical_devices = malloc(sizeof(*physical_devices) * device_count);
-    vkEnumeratePhysicalDevices(instance, &device_count, physical_devices);
-
-    int best_score = INT_MIN;
-    Device_Info best_device = {0};
-
-    for (uint32_t i = 0; i < device_count; i++) {
-        Device_Info info;
-        get_device_info(physical_devices[i], &info);
-
-        int score = rate_physical_device(&info);
-        if (score > best_score) {
-            best_score = score;
-            best_device = info;
-        }
-    }
-
-    free(physical_devices);
-    return best_device;
-}
-
-static VkDevice create_device(const Device_Info *info) {
-    const float queue_priority = 1.0f;
-    const VkDeviceQueueCreateInfo queue_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = info->compute_family_index,
-        .queueCount = 1,
-        .pQueuePriorities = &queue_priority,
-    };
-
-    const VkDeviceCreateInfo device_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pQueueCreateInfos = &queue_info,
-        .queueCreateInfoCount = 1,
-    };
-
-    VkDevice device = NULL;
-    VkResult result = vkCreateDevice(info->physical_device, &device_info, NULL, &device);
-    if (result != VK_SUCCESS) {
-        fprintf(stderr, "vkCreateDevice() failed: %s\n", string_VkResult(result));
-        return NULL;
-    }
-
-    return device;
 }
 
 static uint32_t *read_spirv_file(const char *filename, uint32_t *word_count) {
@@ -492,7 +394,7 @@ static VkDescriptorSet create_descriptor_set(VkDevice device, VkDescriptorPool d
 }
 
 static VmaAllocator create_vma_allocator(VkInstance instance, VkDevice device,
-                                         const Device_Info *info) {
+                                         const Physical_Device_Info *info) {
     const VmaAllocatorCreateInfo vma_allocator_info = {
         .vulkanApiVersion = VK_API_VERSION_1_0,
         .physicalDevice = info->physical_device,
@@ -575,7 +477,7 @@ static VkImageView create_compute_image_view(VkDevice device, VkImage image, VkF
     return view;
 }
 
-static VkCommandPool create_command_pool(VkDevice device, const Device_Info *info) {
+static VkCommandPool create_command_pool(VkDevice device, const Physical_Device_Info *info) {
     const VkCommandPoolCreateInfo command_pool_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -663,66 +565,57 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    Device_Info device_info = find_best_device(instance);
-    if (!device_info.physical_device) {
-        fprintf(stderr, "Failed to find a suitable physical device\n");
-        return EXIT_FAILURE;
-    }
-
-    fprintf(stderr, "Found a suitable physical device: %s\n", device_info.properties.deviceName);
-
-    VkDevice device = create_device(&device_info);
-    if (!device) {
+    Device device;
+    if (!create_device(instance, &device)) {
         fprintf(stderr, "create_device() failed\n");
         return EXIT_FAILURE;
     }
 
-    VkQueue compute_queue;
-    vkGetDeviceQueue(device, device_info.compute_family_index, 0, &compute_queue);
-
-    VkDescriptorSetLayout descriptor_set_layout = create_descriptor_set_layout(device);
+    VkDescriptorSetLayout descriptor_set_layout = create_descriptor_set_layout(device.device);
     if (!descriptor_set_layout) {
         fprintf(stderr, "create_descriptor_set_layout() failed\n");
         return EXIT_FAILURE;
     }
 
-    VkPipelineLayout pipeline_layout = create_pipeline_layout(device, descriptor_set_layout);
+    VkPipelineLayout pipeline_layout = create_pipeline_layout(device.device, descriptor_set_layout);
     if (!descriptor_set_layout) {
         fprintf(stderr, "create_pipeline_layout() failed\n");
         return EXIT_FAILURE;
     }
 
-    VkShaderModule shader = load_shader_module(device, "shaders/pathtracer.comp.spv");
+    VkShaderModule shader = load_shader_module(device.device, "shaders/pathtracer.comp.spv");
     if (!shader) {
         fprintf(stderr, "load_shader_module() failed\n");
         return EXIT_FAILURE;
     }
 
-    const WorkgroupSizes workgroup_sizes = {8, 8, 1};
     const uint32_t image_width = 512;
     const uint32_t image_height = 512;
     VkFormat image_format = VK_FORMAT_R8G8B8A8_UNORM;
 
-    VkPipeline pipeline = create_compute_pipeline(device, pipeline_layout, shader, workgroup_sizes);
+    const WorkgroupSizes workgroup_sizes = {16, 8, 1};
+
+    VkPipeline pipeline =
+        create_compute_pipeline(device.device, pipeline_layout, shader, workgroup_sizes);
     if (!pipeline) {
         fprintf(stderr, "create_pipeline_layout() failed\n");
         return EXIT_FAILURE;
     }
 
-    VkDescriptorPool descriptor_pool = create_descriptor_pool(device);
+    VkDescriptorPool descriptor_pool = create_descriptor_pool(device.device);
     if (!descriptor_pool) {
         fprintf(stderr, "create_descriptor_pool() failed\n");
         return EXIT_FAILURE;
     }
 
     VkDescriptorSet descriptor_set =
-        create_descriptor_set(device, descriptor_pool, descriptor_set_layout);
+        create_descriptor_set(device.device, descriptor_pool, descriptor_set_layout);
     if (!descriptor_set) {
         fprintf(stderr, "create_descriptor_set() failed\n");
         return EXIT_FAILURE;
     }
 
-    VmaAllocator allocator = create_vma_allocator(instance, device, &device_info);
+    VmaAllocator allocator = create_vma_allocator(instance, device.device, &device.info);
     if (!allocator) {
         fprintf(stderr, "create_vma_allocator() failed\n");
         return EXIT_FAILURE;
@@ -736,7 +629,8 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    VkImageView compute_image_view = create_compute_image_view(device, compute_image, image_format);
+    VkImageView compute_image_view =
+        create_compute_image_view(device.device, compute_image, image_format);
     if (!compute_image_view) {
         fprintf(stderr, "create_compute_image_view() failed\n");
         return EXIT_FAILURE;
@@ -752,13 +646,13 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    VkCommandPool command_pool = create_command_pool(device, &device_info);
+    VkCommandPool command_pool = create_command_pool(device.device, &device.info);
     if (!command_pool) {
         fprintf(stderr, "create_command_pool() failed\n");
         return EXIT_FAILURE;
     }
 
-    VkCommandBuffer command_buffer = create_command_buffer(device, command_pool);
+    VkCommandBuffer command_buffer = create_command_buffer(device.device, command_pool);
     if (!command_buffer) {
         fprintf(stderr, "create_command_buffer() failed\n");
         return EXIT_FAILURE;
@@ -778,7 +672,7 @@ int main(void) {
             },
     };
 
-    vkUpdateDescriptorSets(device, 1, &write_descriptor_set, 0, NULL);
+    vkUpdateDescriptorSets(device.device, 1, &write_descriptor_set, 0, NULL);
 
     VkResult record_result = vkBeginCommandBuffer(
         command_buffer, &(VkCommandBufferBeginInfo){
@@ -874,24 +768,24 @@ int main(void) {
         .commandBufferCount = 1,
     };
 
-    vkQueueSubmit(compute_queue, 1, &submit_info, NULL);
-    vkQueueWaitIdle(compute_queue);
+    vkQueueSubmit(device.compute_queue, 1, &submit_info, NULL);
+    vkQueueWaitIdle(device.compute_queue);
 
     uint8_t *data = host_buf_alloc_info.pMappedData;
 
     stbi_write_png("output.png", image_width, image_height, 4, data, 4 * image_width);
 
-    vkDestroyCommandPool(device, command_pool, NULL);
-    vkDestroyImageView(device, compute_image_view, NULL);
+    vkDestroyCommandPool(device.device, command_pool, NULL);
+    vkDestroyImageView(device.device, compute_image_view, NULL);
     vmaDestroyBuffer(allocator, host_buf, host_buf_allocation);
     vmaDestroyImage(allocator, compute_image, compute_image_allocation);
     vmaDestroyAllocator(allocator);
-    vkDestroyDescriptorPool(device, descriptor_pool, NULL);
-    vkDestroyPipeline(device, pipeline, NULL);
-    vkDestroyShaderModule(device, shader, NULL);
-    vkDestroyPipelineLayout(device, pipeline_layout, NULL);
-    vkDestroyDescriptorSetLayout(device, descriptor_set_layout, NULL);
-    vkDestroyDevice(device, NULL);
+    vkDestroyDescriptorPool(device.device, descriptor_pool, NULL);
+    vkDestroyPipeline(device.device, pipeline, NULL);
+    vkDestroyShaderModule(device.device, shader, NULL);
+    vkDestroyPipelineLayout(device.device, pipeline_layout, NULL);
+    vkDestroyDescriptorSetLayout(device.device, descriptor_set_layout, NULL);
+    destroy_device(&device);
     DestroyDebugUtilsMessengerEXT(instance, messenger, NULL);
     vkDestroyInstance(instance, NULL);
     return EXIT_SUCCESS;

@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.10)
 project(calyko VERSION 0.1.0 LANGUAGES C)
 
 add_executable(${PROJECT_NAME}
+    src/device.c
+    src/device.h
     src/main.c
 )
 
